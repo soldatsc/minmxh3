@@ -1,14 +1,13 @@
 """RunPod serverless handler для MiniMax-H3 (видео + звук).
 
-Контракт совместим с текущим видео-воркером — user-api не меняется:
     вход  {"input": {"workflow": {...}, "images": [{"name","image"}], "with_audio": bool}}
-    выход {"video": "<base64 mp4>", "seed": ..., "frames": ..., "duration_s": ...}
+    выход {"video": "<base64 mp4>", "duration_s": ...}
 
-Ключевые решения продиктованы проданными граблями (см. README):
-* ComfyUI течёт по памяти и умирает на 283-500 задаче → сами выходим раньше;
-* мёртвый ComfyUI = мгновенные фейлы у живых юзеров → health-check ДО задачи;
-* картинки юзера кладём во временные имена и удаляем после, чтобы тёплый
-  воркер не переиспользовал чужой кадр (та же защита, что в krea-воркере).
+Конструкция учитывает поведение долгоживущего ComfyUI-процесса:
+* он упирается в память и перестаёт отвечать → выходим раньше по счётчику задач;
+* мёртвый процесс = серия мгновенных ошибок → health-check ДО взятия задачи;
+* входные изображения удаляем после задачи, чтобы тёплый под не переиспользовал
+  чужой кадр.
 """
 from __future__ import annotations
 
@@ -31,21 +30,20 @@ COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_INPUT_DIR = Path(os.environ.get("COMFY_INPUT_DIR", "/comfyui/input"))
 COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", "/comfyui/output"))
 
-# Сколько задач берём до добровольного выхода. 200 — с запасом до минимальной
-# наблюдаемой смерти (283 задачи на krea-пуле 06.08). RunPod поднимет новый под.
+# Сколько задач берём до добровольного выхода. 200 — с запасом до наблюдаемого
+# порога отказа (~280+ задач). RunPod поднимет новый под.
 MAX_JOBS_BEFORE_EXIT = int(os.environ.get("MAX_JOBS_BEFORE_EXIT", "200"))
 # Сколько ждём ComfyUI при старте пода (модели 33B грузятся долго).
 COMFY_BOOT_TIMEOUT_S = int(os.environ.get("COMFY_BOOT_TIMEOUT_S", "600"))
-# Потолок на одну генерацию. Наш поллер в user-api ждёт до 600с — держим ниже,
-# чтобы воркер сам вернул ошибку раньше, чем клиент отвалится по таймауту.
+# Потолок на одну генерацию: держим ниже клиентского таймаута (600с), чтобы
+# воркер сам вернул ошибку раньше, чем клиент отвалится.
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "540"))
 
 _jobs_done = 0
 
 
 def _comfy_alive() -> bool:
-    """ComfyUI отвечает? Это тот самый признак, по которому в проде ловили
-    мёртвые поды (`not reachable after multiple retries`)."""
+    """ComfyUI отвечает? Признак мёртвого пода: `not reachable after retries`."""
     try:
         r = requests.get(f"http://{COMFY_HOST}/system_stats", timeout=5)
         return r.status_code == 200
@@ -199,7 +197,7 @@ def handler(job: dict) -> dict:
         return result
     except TimeoutError as e:
         return {"error": str(e), "stage": "generate"}
-    except Exception as e:  # noqa: BLE001 — наружу отдаём текст, RunPod пометит FAILED
+    except Exception as e:  # noqa: BLE001 — текст наружу, RunPod пометит FAILED
         return {"error": f"{type(e).__name__}: {str(e)[:300]}", "stage": "generate"}
     finally:
         for p in staged:
