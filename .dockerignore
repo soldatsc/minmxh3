@@ -1,0 +1,9 @@
+.git/
+.gitignore
+README.md
+models/
+*.safetensors
+*.mp4
+out/
+__pycache__/
+.venv/
