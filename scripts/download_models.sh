@@ -7,6 +7,8 @@
 #
 # Приватных репозиториев тут нет, токен не нужен. Если HF начнёт лимитировать —
 # положить токен в HF_TOKEN, aria2 подхватит через заголовок.
+#
+# Итого ~40 ГБ: база 19.5 + энкодер 14.6 + VAE 5.5 + LoRA 0.6. Тому хватит 60 ГБ.
 set -euo pipefail
 
 DEST="${1:-/comfyui/models}"
@@ -28,14 +30,14 @@ dl() {  # dl <repo> <файл> <подпапка>
 }
 
 # ── База: i2v (first/last frame) в pruned_int8 — влезает в 24-32 ГБ ──
-dl "Comfy-Org/MiniMax-H3" "split_files/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors" "diffusion_models"
+dl "Comfy-Org/MiniMax-H3" "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors" "diffusion_models"   # 19.5 ГБ
 
 # ── Текстовый энкодер ──
-dl "Comfy-Org/MiniMax-H3" "split_files/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" "text_encoders"
+dl "Comfy-Org/MiniMax-H3" "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors" "text_encoders"   # 14.6 ГБ
 
 # ── VAE: видео + аудио (аудио нужен даже для «без звука» — модель считает обе ветки) ──
-dl "Comfy-Org/MiniMax-H3" "split_files/vae/minimax_h3_video_vae_fp16.safetensors" "vae"
-dl "Comfy-Org/MiniMax-H3" "split_files/vae/minimax_h3_audio_vae_fp32.safetensors" "vae"
+dl "Comfy-Org/MiniMax-H3" "vae/minimax_h3_video_vae_fp16.safetensors" "vae"   # 4.9 ГБ
+dl "Comfy-Org/MiniMax-H3" "vae/minimax_h3_audio_vae_fp32.safetensors" "vae"   # 0.6 ГБ
 
 # ── Turbo-LoRA: 6-8 шагов вместо ~20 ──
 # Именно pruned-конверсия под штатный лоадер (оригинал larryvrh — под кастом-ноды).
