@@ -1,0 +1,84 @@
+name: build & push image
+
+# Собираем на пуш в main и по кнопке. Модели в образ НЕ запекаем (BAKE_MODELS=0):
+# с ними образ ~60 ГБ, раннер GitHub столько не вывезет — веса приезжают на
+# network volume, см. scripts/download_models.sh.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'workflows/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Доп. тег образа (кроме latest и sha)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Раннер даёт ~14 ГБ свободного места, а слой с torch+cu128 и ComfyUI
+      # уже около того. Без этой уборки билд падает на "no space left on
+      # device" где-то в середине pip install — сносим то, чего в образе
+      # заведомо нет: .NET, Android SDK, Haskell, лишние тулчейны.
+      - name: Освободить место на раннере
+        run: |
+          echo "До очистки:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "После очистки:"; df -h / | tail -1
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Метаданные образа
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      - name: Сборка и пуш
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BAKE_MODELS=0
+          # Кеш в GHA: слой с torch тянется минут пять, без кеша каждая правка
+          # хендлера пересобирала бы всё заново.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Итог
+        run: |
+          echo "### Образ собран" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Указать этот образ в RunPod serverless endpoint." >> $GITHUB_STEP_SUMMARY

@@ -4,24 +4,30 @@
 Экспорт: в ComfyUI меню → `Workflow → Export (API)`. UI-формат воркер не
 примет — у него другая структура, ноды лежат в `nodes[]`, а не по id.
 
-Ожидаемые файлы:
+## Что уже лежит
 
-| Файл | Что делает |
-|---|---|
-| `i2v_turbo.json` | фото → видео + звук, Turbo-LoRA, 6-8 шагов |
-| `i2v_turbo_noaudio.json` | то же, но без подмешивания звука (`with_audio: false`) |
+**`fl_turbo_example.ui.json`** — эталонный воркфлоу автора Turbo-LoRA
+(`drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`), **UI-формат**. Внутри ровно то, что
+нам нужно: `MiniMaxH3ImageToVideo` (i2v по первому/последнему кадру),
+`LoraLoaderModelOnly` с Turbo, `MiniMaxH3SigmaShift`, раздельный декод видео и
+аудио (`VAEDecode` + `VAEDecodeAudio`), сборка mp4 через `VHS_VideoCombine` и
+патчи экономии памяти (sage-attention, spectrum).
 
-## Как готовить
+Кастом-ноды под него уже стоят в образе — KJNodes, SolAttn, VideoHelperSuite,
+Turbo. Кроме `SpectrumApplyMiniMaxH3`: публичного репозитория не нашлось, при
+первом открытии ComfyUI отметит её как missing — либо удалить из графа, либо
+доставить через Manager (и тогда дописать в Dockerfile).
 
-1. Берём официальный [MiniMax H3: Image to Video](https://comfy.org/workflows/a781503cf508-a781503cf508/)
-   либо `fl_minimax_h3_turbo_lora_example_workflow.json` из репозитория drbaph
-   (там уже first/last-frame + Turbo).
-2. Прикручиваем Turbo двумя правками: нода LoRA между загрузчиком модели и
-   сэмплером, сила 0.8-1.8 (старт — 1.0); сэмплер меняем на
-   «MiniMax-H3 Turbo Sampler».
-3. Отлаживаем прямо в образе: `docker run ... -e SERVE_API=1` даёт обычный
-   ComfyUI на 8188 в той же среде, где потом побежит прод.
-4. Экспорт в API-формате → сюда.
+## Что нужно сделать
+
+Воркер принимает **только API-формат**, поэтому:
+
+1. Поднять образ в режиме отладки:
+   `docker run --gpus all -p 8188:8188 -v <модели>:/runpod-volume -e SERVE_API=1 <образ>`
+2. Открыть `fl_turbo_example.ui.json` в ComfyUI, прогнать один клип, покрутить
+   параметры под наше железо.
+3. `Workflow → Export (API)` → сохранить сюда как `i2v_turbo.json`
+   (и, если нужен отдельный вариант без звука, `i2v_turbo_noaudio.json`).
 
 ## Стартовые значения
 

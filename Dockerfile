@@ -27,14 +27,38 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI /comfyui && \
     cd /comfyui && git checkout ${COMFY_REF} && \
     pip install -r requirements.txt
 
-# Кастом-ноды Turbo: нужны для звукового режима — их сэмплер ведёт видео и
-# аудио по разным расписаниям. Стоковый на 6-8 шагах перешагивает аудио, и
-# звук выходит рваным.
-RUN git clone https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo \
-        /comfyui/custom_nodes/ComfyUI-MiniMax-H3-Turbo && \
-    if [ -f /comfyui/custom_nodes/ComfyUI-MiniMax-H3-Turbo/requirements.txt ]; then \
-        pip install -r /comfyui/custom_nodes/ComfyUI-MiniMax-H3-Turbo/requirements.txt; \
-    fi
+# ── Кастом-ноды ─────────────────────────────────────────────────────────
+# Состав продиктован эталонным воркфлоу (workflows/fl_turbo_example.ui.json):
+#   Turbo          — свой сэмплер, ведёт видео и аудио по РАЗНЫМ расписаниям;
+#                    стоковый на 6-8 шагах перешагивает аудио, и звук рвётся;
+#   KJNodes        — загрузчик модели + патч sage-attention (memory-efficient),
+#                    без него 33B в 32 ГБ не укладывается;
+#   Spectrum       — SpectrumApplyMiniMaxH3, качество на малых шагах;
+#   SolAttn        — альтернативный attention-патч (triton);
+#   VideoHelper    — VHS_VideoCombine, сборка mp4 из кадров + аудио.
+RUN set -eux; \
+    for repo in \
+        "https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo" \
+        "https://github.com/kijai/ComfyUI-KJNodes" \
+        "https://github.com/kijai/ComfyUI-SolAttn_triton" \
+        "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite" \
+    ; do \
+        name=$(basename "$repo"); \
+        git clone --depth 1 "$repo" "/comfyui/custom_nodes/$name"; \
+        if [ -f "/comfyui/custom_nodes/$name/requirements.txt" ]; then \
+            pip install -r "/comfyui/custom_nodes/$name/requirements.txt"; \
+        fi; \
+    done
+
+# sageattention — рычаг скорости/памяти, который дёргают патч-ноды выше.
+# Ставим отдельно: в requirements кастом-нод он не всегда прописан, а без
+# пакета ноды молча деградируют к обычному attention.
+RUN pip install sageattention || echo "[warn] sageattention не встал — патчи будут работать вхолостую"
+
+# ⚠️ Spectrum-ноды (comfyui-spectrum-minimax-h3) в эталонном воркфлоу есть, но
+# публичного репозитория у них на момент сборки не нашлось. Воркфлоу без них
+# запустится — ComfyUI сообщит про отсутствующую ноду, её надо либо удалить из
+# графа, либо доустановить через ComfyUI-Manager и добавить сюда.
 
 WORKDIR /
 
