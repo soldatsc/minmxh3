@@ -17,15 +17,20 @@ BASE="https://huggingface.co"
 dl() {  # dl <repo> <файл> <подпапка>
     local repo="$1" file="$2" sub="$3"
     local dir="$DEST/$sub"
+    # 🔴 Только ИМЯ файла: в репозитории HF путь содержит подпапку
+    # (vae/файл.safetensors), и если отдать её в -o, aria2 воспроизведёт её
+    # внутри целевого каталога → models/vae/vae/файл. ComfyUI такие модели
+    # не находит, а выглядит это как «скачалось, но модели нет».
+    local name="${file##*/}"
     mkdir -p "$dir"
-    if [ -f "$dir/$file" ]; then
-        echo "[models] $file уже на месте — пропускаем"
+    if [ -f "$dir/$name" ]; then
+        echo "[models] $name уже на месте — пропускаем"
         return 0
     fi
-    echo "[models] качаем $file → $sub"
+    echo "[models] качаем $name → $sub"
     aria2c -x 8 -s 8 -k 1M --console-log-level=warn \
         ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} \
-        -d "$dir" -o "$file" \
+        -d "$dir" -o "$name" \
         "$BASE/$repo/resolve/main/$file"
 }
 
