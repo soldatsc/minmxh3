@@ -22,7 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --upgrade pip && \
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-ARG COMFY_REF=master
+# Пин на релиз, не master: v0.31.0 несёт фикс аудио-сэмплера H3 (kijai
+# PR#15243, ModelSamplingAV) и лора-лоадер с автодетектом pruned-базы.
+# Spectrum ниже требует ComfyUI >= e377e263 и покрывает контракт v0.31.
+ARG COMFY_REF=v0.31.0
 RUN git clone https://github.com/comfyanonymous/ComfyUI /comfyui && \
     cd /comfyui && git checkout ${COMFY_REF} && \
     pip install -r requirements.txt
@@ -42,6 +45,7 @@ RUN set -eux; \
         "https://github.com/kijai/ComfyUI-KJNodes" \
         "https://github.com/kijai/ComfyUI-SolAttn_triton" \
         "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite" \
+        "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3" \
     ; do \
         name=$(basename "$repo"); \
         git clone --depth 1 "$repo" "/comfyui/custom_nodes/$name"; \
@@ -55,10 +59,9 @@ RUN set -eux; \
 # пакета ноды молча деградируют к обычному attention.
 RUN pip install sageattention || echo "[warn] sageattention не встал — патчи будут работать вхолостую"
 
-# ⚠️ Spectrum-ноды (comfyui-spectrum-minimax-h3) в эталонном воркфлоу есть, но
-# публичного репозитория у них на момент сборки не нашлось. Воркфлоу без них
-# запустится — ComfyUI сообщит про отсутствующую ноду, её надо либо удалить из
-# графа, либо доустановить через ComfyUI-Manager и добавить сюда.
+# Spectrum (xmarre) добавлен в список выше 2026-08-10 — репозиторий появился.
+# ⚠️ По README Spectrum — аппроксиматор: на сложном движении возможны
+# «malformed fingers/limbs». В прод-шаблонах включать осознанно, A/B на сиде.
 
 WORKDIR /
 
