@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.11 /usr/bin/python \
-    && python -m ensurepip --upgrade
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python
 
 # PyTorch под cu128. Ставим ПЕРЕД ComfyUI: иначе его requirements подтянут
 # сборку под другую CUDA, и на 5090 всё развалится в рантайме.
