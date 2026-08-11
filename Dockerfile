@@ -15,12 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3-pip git ffmpeg curl aria2 \
         libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && python -m ensurepip --upgrade
 
 # PyTorch под cu128. Ставим ПЕРЕД ComfyUI: иначе его requirements подтянут
 # сборку под другую CUDA, и на 5090 всё развалится в рантайме.
-RUN pip install --upgrade pip && \
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# apt python3-pip = pip для СИСТЕМНОГО 3.10, а python=3.11 — поэтому только
+# python -m pip: иначе пакеты не в том интерпретаторе (крашлуп 11.08).
+RUN python -m pip install --upgrade pip && \
+    python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # Пин на релиз, не master: v0.31.0 несёт фикс аудио-сэмплера H3 (kijai
 # PR#15243, ModelSamplingAV) и лора-лоадер с автодетектом pruned-базы.
@@ -28,7 +31,7 @@ RUN pip install --upgrade pip && \
 ARG COMFY_REF=v0.31.0
 RUN git clone https://github.com/comfyanonymous/ComfyUI /comfyui && \
     cd /comfyui && git checkout ${COMFY_REF} && \
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
 
 # ── Кастом-ноды ─────────────────────────────────────────────────────────
 # Состав продиктован эталонным воркфлоу (workflows/fl_turbo_example.ui.json):
@@ -50,14 +53,14 @@ RUN set -eux; \
         name=$(basename "$repo"); \
         git clone --depth 1 "$repo" "/comfyui/custom_nodes/$name"; \
         if [ -f "/comfyui/custom_nodes/$name/requirements.txt" ]; then \
-            pip install -r "/comfyui/custom_nodes/$name/requirements.txt"; \
+            python -m pip install -r "/comfyui/custom_nodes/$name/requirements.txt"; \
         fi; \
     done
 
 # sageattention — рычаг скорости/памяти, который дёргают патч-ноды выше.
 # Ставим отдельно: в requirements кастом-нод он не всегда прописан, а без
 # пакета ноды молча деградируют к обычному attention.
-RUN pip install sageattention || echo "[warn] sageattention не встал — патчи будут работать вхолостую"
+RUN python -m pip install sageattention || echo "[warn] sageattention не встал — патчи будут работать вхолостую"
 
 # Spectrum (xmarre) добавлен в список выше 2026-08-10 — репозиторий появился.
 # ⚠️ По README Spectrum — аппроксиматор: на сложном движении возможны
@@ -66,7 +69,7 @@ RUN pip install sageattention || echo "[warn] sageattention не встал — 
 WORKDIR /
 
 COPY requirements.txt /requirements.txt
-RUN pip install -r /requirements.txt
+RUN python -m pip install -r /requirements.txt
 
 COPY handler.py /handler.py
 COPY scripts/ /scripts/
