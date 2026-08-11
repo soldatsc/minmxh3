@@ -12,16 +12,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COMFY_OUTPUT_DIR=/comfyui/output
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3-pip git ffmpeg curl aria2 \
+        python3 python3-venv python3-pip git ffmpeg curl aria2 \
         libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python
+    && ln -sf /usr/bin/python3.10 /usr/bin/python
 
 # PyTorch под cu128. Ставим ПЕРЕД ComfyUI: иначе его requirements подтянут
 # сборку под другую CUDA, и на 5090 всё развалится в рантайме.
-# apt python3-pip = pip для СИСТЕМНОГО 3.10, а python=3.11 — поэтому только
-# python -m pip: иначе пакеты не в том интерпретаторе (крашлуп 11.08).
+# python = системный 3.10 (стабильный). НЕ python3.11: в Ubuntu 22.04 это
+# 3.11.0rc1, на котором torch.jit сегфолтится (краш воркера 11.08).
+# Все установки строго python -m pip — один интерпретатор везде.
 RUN python -m pip install --upgrade pip && \
     python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
