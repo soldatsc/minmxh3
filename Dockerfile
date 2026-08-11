@@ -11,8 +11,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COMFY_INPUT_DIR=/comfyui/input \
     COMFY_OUTPUT_DIR=/comfyui/output
 
+# gcc+python3-dev нужны В РАНТАЙМЕ: triton (под sageattention) компилирует
+# свой CUDA-стаб при первом вызове ядра — без cc джоба падает на 0-м шаге.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip git ffmpeg curl aria2 \
+        python3 python3-venv python3-pip python3-dev gcc git ffmpeg curl aria2 \
         libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/bin/python
