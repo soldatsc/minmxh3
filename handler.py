@@ -41,6 +41,78 @@ JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "540"))
 
 _jobs_done = 0
 
+# ── RAM-проба (2026-08-16) ────────────────────────────────────────────────
+# Воркеры умирают по RAM ПОСРЕДИ первой джобы на одном и том же шаге семплинга
+# (лог 16.08: 6-7/8, хост 251 ГБ, лимит контейнера 83) — не накопление между
+# джобами. Чтобы не гадать, что растёт, пишем раз в RAM_PROBE_INTERVAL_S:
+# cgroup memory.current/max контейнера + RSS процесса ComfyUI. Кривая в логе
+# RunPod → видно точку и скорость роста. RAM_PROBE_INTERVAL_S=0 — выключить.
+import threading
+
+RAM_PROBE_INTERVAL_S = float(os.environ.get("RAM_PROBE_INTERVAL_S", "5"))
+
+
+def _read_first(paths: tuple[str, ...]) -> str | None:
+    for p in paths:
+        try:
+            return Path(p).read_text().strip()
+        except OSError:
+            continue
+    return None
+
+
+def _cgroup_mem() -> tuple[float | None, float | None]:
+    """(current_gb, max_gb) контейнера; None — не смогли прочитать."""
+    cur = _read_first(("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+    mx = _read_first(("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    def _gb(v: str | None) -> float | None:
+        if v is None or v == "max":
+            return None
+        try:
+            n = int(v)
+        except ValueError:
+            return None
+        return None if n > 9_000_000_000_000 else round(n / 1024 ** 3, 1)
+    return _gb(cur), _gb(mx)
+
+
+def _comfy_rss_gb() -> float | None:
+    """RSS процесса `python main.py` (ComfyUI) по /proc — без psutil."""
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except OSError:
+                continue
+            if b"main.py" in cmd and b"python" in cmd:
+                for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        return round(int(line.split()[1]) / 1024 ** 2, 1)
+    except Exception:  # noqa: BLE001 — проба не должна ничего ронять
+        pass
+    return None
+
+
+def _ram_probe(stop: threading.Event, tag: str) -> None:
+    t0 = time.time()
+    while not stop.wait(RAM_PROBE_INTERVAL_S):
+        cur, mx = _cgroup_mem()
+        rss = _comfy_rss_gb()
+        print(
+            f"[h3-worker] RAM t+{int(time.time() - t0)}s job={tag} "
+            f"cgroup={cur}/{mx}GB comfy_rss={rss}GB",
+            flush=True,
+        )
+
+
+def _start_ram_probe(tag: str) -> threading.Event:
+    stop = threading.Event()
+    if RAM_PROBE_INTERVAL_S > 0:
+        threading.Thread(target=_ram_probe, args=(stop, tag), daemon=True).start()
+    return stop
+
 
 def _comfy_alive() -> bool:
     """ComfyUI отвечает? Признак мёртвого пода: `not reachable after retries`."""
@@ -175,6 +247,9 @@ def handler(job: dict) -> dict:
     client_id = str(uuid.uuid4())
     staged: list[Path] = []
     started = time.time()
+    _probe_stop = _start_ram_probe(str(job.get("id", "?"))[:12])
+    _c0, _m0 = _cgroup_mem()
+    print(f"[h3-worker] RAM at job start: cgroup={_c0}/{_m0}GB comfy_rss={_comfy_rss_gb()}GB", flush=True)
     try:
         staged = _stage_images(job_input.get("images") or [])
         prompt_id = _queue_prompt(workflow, client_id)
@@ -200,6 +275,7 @@ def handler(job: dict) -> dict:
     except Exception as e:  # noqa: BLE001 — текст наружу, RunPod пометит FAILED
         return {"error": f"{type(e).__name__}: {str(e)[:300]}", "stage": "generate"}
     finally:
+        _probe_stop.set()
         for p in staged:
             try:
                 p.unlink(missing_ok=True)
