@@ -84,4 +84,11 @@ RUN chmod +x /scripts/*.sh
 ARG BAKE_MODELS=0
 RUN if [ "$BAKE_MODELS" = "1" ]; then /scripts/download_models.sh /comfyui/models; fi
 
+# Лоры — отдельно от больших весов (2026-08-28). Они весят ~230 МБ, влезают в
+# раннер GitHub и едут ВМЕСТЕ С ОБРАЗОМ: том может потеряться, а лоры нужны
+# всегда. Большие модели (~40 ГБ) при этом по-прежнему приезжают с тома.
+# start.sh симлинкует том с флагом -n, то есть запечённое не перетирается.
+ARG BAKE_LORAS=1
+RUN if [ "$BAKE_LORAS" = "1" ]; then ONLY_LORAS=1 /scripts/download_models.sh /comfyui/models; fi
+
 ENTRYPOINT ["/scripts/start.sh"]
