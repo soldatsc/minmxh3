@@ -35,6 +35,13 @@ COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", "/comfyui/output"))
 MAX_JOBS_BEFORE_EXIT = int(os.environ.get("MAX_JOBS_BEFORE_EXIT", "200"))
 # Сколько ждём ComfyUI при старте пода (модели 33B грузятся долго).
 COMFY_BOOT_TIMEOUT_S = int(os.environ.get("COMFY_BOOT_TIMEOUT_S", "600"))
+# Прогрев перед первой задачей — не дольше WARMUP_MAX_S и только пока весь старт
+# контейнера укладывается в лимит RunPod: холодный старт дольше 7 мин
+# (RUNPOD_INIT_TIMEOUT, по умолчанию 420 с) помечает воркер нездоровым, а эндпоинт
+# с такими воркерами RunPod урезает (docs: serverless/development/optimization).
+WARMUP_MAX_S = int(os.environ.get("WARMUP_MAX_S", "120"))
+INIT_LIMIT_S = int(os.environ.get("RUNPOD_INIT_TIMEOUT", "420"))
+INIT_MARGIN_S = 60
 # Потолок на всю задачу, считая от её начала (проверка ComfyUI, постановка,
 # генерация): держим ниже executionTimeout эндпоинта (600 с) — его превышение
 # RunPod карает остановкой воркера, а не только провалом задачи. 570: раньше
@@ -167,13 +174,29 @@ def _comfy_ready_for_job(job_deadline: float) -> bool:
         time.sleep(5)
 
 
+def _container_uptime_s() -> float | None:
+    """Сколько секунд живёт контейнер: возраст PID 1 по /proc (Linux). None — не знаем."""
+    try:
+        start_ticks = int(Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()[19])
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return max(0.0, uptime - start_ticks / os.sysconf("SC_CLK_TCK"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _warm_up() -> None:
     """До первой задачи: /object_info заставляет ComfyUI один раз перечислить
     модели на сетевом диске — на свежем поде именно первая задача упиралась в
-    медленный диск (20.10). Ошибка не фатальна: тогда прогреет сама задача."""
+    медленный диск (20.10). Ошибка/таймаут не фатальны: ComfyUI дочитает сам,
+    первая задача подождёт его в _comfy_ready_for_job."""
+    up = _container_uptime_s()
+    budget = WARMUP_MAX_S if up is None else min(WARMUP_MAX_S, INIT_LIMIT_S - INIT_MARGIN_S - up)
+    if budget < 5:
+        print(f"[h3-worker] warm-up skipped: container up {up:.0f}s, init limit {INIT_LIMIT_S}s", flush=True)
+        return
     t0 = time.time()
     try:
-        requests.get(f"http://{COMFY_HOST}/object_info", timeout=COMFY_BOOT_TIMEOUT_S).raise_for_status()
+        requests.get(f"http://{COMFY_HOST}/object_info", timeout=budget).raise_for_status()
         print(f"[h3-worker] warm-up done in {time.time() - t0:.0f}s", flush=True)
     except Exception as e:  # noqa: BLE001 — прогрев не должен ронять под
         print(f"[h3-worker] warm-up failed after {time.time() - t0:.0f}s: {e}", flush=True)
