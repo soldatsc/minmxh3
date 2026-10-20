@@ -232,7 +232,7 @@ def _drop_prompt(prompt_id: str) -> None:
     встанет за ней. Best effort: ComfyUI может не ответить."""
     for path, body in (("/queue", {"delete": [prompt_id]}), ("/interrupt", {"prompt_id": prompt_id})):
         try:
-            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=5)
+            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=3)
         except Exception as e:  # noqa: BLE001
             print(f"[h3-worker] {path} for {prompt_id} failed: {e}", flush=True)
 
@@ -246,6 +246,8 @@ def _await_completion(ws: "websocket.WebSocket", prompt_id: str, job_deadline: f
     while True:
         ws.settimeout(_left_s(job_deadline))
         msg = ws.recv()
+        if not msg:  # ComfyUI закрыл соединение — без этого ошибка выглядела как JSONDecodeError
+            raise RuntimeError("ComfyUI closed the websocket mid-job")
         if isinstance(msg, bytes):
             continue  # превью-кадры — игнорируем
         data = json.loads(msg)
@@ -260,7 +262,9 @@ def _await_completion(ws: "websocket.WebSocket", prompt_id: str, job_deadline: f
                     f"ComfyUI execution error: {str(d.get('exception_message'))[:300]}"
                 )
 
-    r = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}", timeout=30)
+    # История — тоже в пределах бюджета (+15 с на хвост), чтобы задача не вылезла за 600 с.
+    r = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}",
+                     timeout=min(30, max(5, job_deadline + 15 - time.time())))
     r.raise_for_status()
     return r.json().get(prompt_id, {})
 
@@ -331,7 +335,7 @@ def handler(job: dict) -> dict:
             finished = True
         finally:
             try:
-                ws.close()
+                ws.close(timeout=1)
             except Exception:
                 pass
 
