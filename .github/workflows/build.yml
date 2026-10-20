@@ -68,7 +68,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
           tags: |
-            type=sha,format=short
+            type=sha,format=short,enable=${{ !inputs.full }}
+            type=sha,format=short,suffix=-full,enable=${{ inputs.full == true }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Сборка и пуш

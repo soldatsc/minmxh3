@@ -192,7 +192,7 @@ def _warm_up() -> None:
     up = _container_uptime_s()
     budget = WARMUP_MAX_S if up is None else min(WARMUP_MAX_S, INIT_LIMIT_S - INIT_MARGIN_S - up)
     if budget < 5:
-        print(f"[h3-worker] warm-up skipped: container up {up:.0f}s, init limit {INIT_LIMIT_S}s", flush=True)
+        print(f"[h3-worker] warm-up skipped: container up {up}s, budget {budget}s", flush=True)
         return
     t0 = time.time()
     try:
@@ -311,7 +311,7 @@ def _collect_video(history: dict) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _strip_audio(src: Path) -> Path:
+def _strip_audio(src: Path, job_deadline: float) -> Path:
     """Отдельный mp4 без звуковой дорожки (режим with_audio=false).
 
     Пересжатия нет — только выбрасываем дорожку, поэтому это доли секунды.
@@ -319,7 +319,8 @@ def _strip_audio(src: Path) -> Path:
     dst = src.with_name(f"{src.stem}_noaudio{src.suffix}")
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-an", "-c:v", "copy", str(dst)],
-        check=True, capture_output=True, timeout=120,
+        check=True, capture_output=True,
+        timeout=min(120, max(5, job_deadline + 20 - time.time())),  # в пределах бюджета задачи
     )
     return dst
 
@@ -367,7 +368,7 @@ def handler(job: dict) -> dict:
             return {"error": "no video in ComfyUI output", "stage": "collect"}
 
         if job_input.get("with_audio", True) is False:
-            video_path = _strip_audio(video_path)
+            video_path = _strip_audio(video_path, job_deadline)
 
         payload = base64.b64encode(video_path.read_bytes()).decode("ascii")
         result = {
