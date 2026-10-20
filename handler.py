@@ -38,6 +38,13 @@ COMFY_BOOT_TIMEOUT_S = int(os.environ.get("COMFY_BOOT_TIMEOUT_S", "600"))
 # Потолок на одну генерацию: держим ниже клиентского таймаута (600с), чтобы
 # воркер сам вернул ошибку раньше, чем клиент отвалится.
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "540"))
+# Ожидание ответа ComfyUI на постановку задачи и на websocket. Было 30 с: 20.10
+# на медленном сетевом диске свежий под отвечал на первую задачу дольше —
+# хендлер бросал её (Failed за 30,5 с), а следующую считал «ComfyUI мёртв» и
+# перезапускал под. Каждый новый под сжигал две задачи людей.
+COMFY_HTTP_TIMEOUT_S = int(os.environ.get("COMFY_HTTP_TIMEOUT_S", "300"))
+# Сколько перед задачей ждём ComfyUI, который не отвечает, но процесс жив (занят).
+PRE_JOB_ALIVE_WAIT_S = int(os.environ.get("PRE_JOB_ALIVE_WAIT_S", "120"))
 
 _jobs_done = 0
 
@@ -76,20 +83,30 @@ def _cgroup_mem() -> tuple[float | None, float | None]:
     return _gb(cur), _gb(mx)
 
 
+def _comfy_pid() -> str | None:
+    """PID процесса `python main.py` (ComfyUI) по /proc — без psutil.
+    У умершего (зомби) процесса cmdline пустой — он не находится."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"main.py" in cmd and b"python" in cmd:
+            return pid
+    return None
+
+
 def _comfy_rss_gb() -> float | None:
-    """RSS процесса `python main.py` (ComfyUI) по /proc — без psutil."""
+    """RSS процесса ComfyUI."""
     try:
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            try:
-                cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
-            except OSError:
-                continue
-            if b"main.py" in cmd and b"python" in cmd:
-                for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-                    if line.startswith("VmRSS:"):
-                        return round(int(line.split()[1]) / 1024 ** 2, 1)
+        pid = _comfy_pid()
+        if pid is None:
+            return None
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024 ** 2, 1)
     except Exception:  # noqa: BLE001 — проба не должна ничего ронять
         pass
     return None
@@ -114,13 +131,39 @@ def _start_ram_probe(tag: str) -> threading.Event:
     return stop
 
 
-def _comfy_alive() -> bool:
+def _comfy_alive(timeout: float = 5) -> bool:
     """ComfyUI отвечает? Признак мёртвого пода: `not reachable after retries`."""
     try:
-        r = requests.get(f"http://{COMFY_HOST}/system_stats", timeout=5)
+        r = requests.get(f"http://{COMFY_HOST}/system_stats", timeout=timeout)
         return r.status_code == 200
     except Exception:
         return False
+
+
+def _comfy_ready_for_job() -> bool:
+    """ComfyUI отвечает — берём задачу. Не отвечает, но процесс жив — он занят,
+    ждём до PRE_JOB_ALIVE_WAIT_S. Процесса нет или не дождались — под мёртв.
+    Раньше хватало одного запроса на 5 с, и занятый ComfyUI считался мёртвым (20.10)."""
+    deadline = time.time() + PRE_JOB_ALIVE_WAIT_S
+    while True:
+        if _comfy_alive(timeout=10):
+            return True
+        if _comfy_pid() is None or time.time() >= deadline:
+            return False
+        print("[h3-worker] ComfyUI busy, process alive — waiting", flush=True)
+        time.sleep(5)
+
+
+def _warm_up() -> None:
+    """До первой задачи: /object_info заставляет ComfyUI один раз перечислить
+    модели на сетевом диске — на свежем поде именно первая задача упиралась в
+    медленный диск (20.10). Ошибка не фатальна: тогда прогреет сама задача."""
+    t0 = time.time()
+    try:
+        requests.get(f"http://{COMFY_HOST}/object_info", timeout=COMFY_BOOT_TIMEOUT_S).raise_for_status()
+        print(f"[h3-worker] warm-up done in {time.time() - t0:.0f}s", flush=True)
+    except Exception as e:  # noqa: BLE001 — прогрев не должен ронять под
+        print(f"[h3-worker] warm-up failed after {time.time() - t0:.0f}s: {e}", flush=True)
 
 
 def _wait_for_comfy(timeout_s: int) -> bool:
@@ -153,7 +196,7 @@ def _queue_prompt(workflow: dict, client_id: str) -> str:
     r = requests.post(
         f"http://{COMFY_HOST}/prompt",
         json={"prompt": workflow, "client_id": client_id},
-        timeout=30,
+        timeout=COMFY_HTTP_TIMEOUT_S,
     )
     r.raise_for_status()
     return r.json()["prompt_id"]
@@ -166,7 +209,7 @@ def _await_completion(prompt_id: str, client_id: str, timeout_s: int) -> dict:
     заваливает ComfyUI лишними запросами, а нам важна каждая секунда GPU.
     """
     ws = websocket.WebSocket()
-    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=30)
+    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=COMFY_HTTP_TIMEOUT_S)
     ws.settimeout(timeout_s)
     deadline = time.time() + timeout_s
     try:
@@ -240,7 +283,7 @@ def handler(job: dict) -> dict:
 
     # Мёртвый ComfyUI — не берём задачу вообще: пусть RunPod отдаст её другому
     # поду, а этот уйдёт. Иначе получаем серию мгновенных фейлов у живых юзеров.
-    if not _comfy_alive():
+    if not _comfy_ready_for_job():
         _exit_worker("comfyui dead before job")
         return {"error": "ComfyUI is not reachable", "stage": "healthcheck"}
 
@@ -298,5 +341,6 @@ if __name__ == "__main__":
     if not _wait_for_comfy(COMFY_BOOT_TIMEOUT_S):
         print("[h3-worker] ComfyUI did not come up in time", flush=True)
         sys.exit(1)
+    _warm_up()
     print("[h3-worker] ComfyUI is up, serving", flush=True)
     runpod.serverless.start({"handler": handler})
