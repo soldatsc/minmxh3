@@ -35,13 +35,17 @@ COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", "/comfyui/output"))
 MAX_JOBS_BEFORE_EXIT = int(os.environ.get("MAX_JOBS_BEFORE_EXIT", "200"))
 # Сколько ждём ComfyUI при старте пода (модели 33B грузятся долго).
 COMFY_BOOT_TIMEOUT_S = int(os.environ.get("COMFY_BOOT_TIMEOUT_S", "600"))
-# Потолок на одну генерацию: держим ниже клиентского таймаута (600с), чтобы
-# воркер сам вернул ошибку раньше, чем клиент отвалится.
-JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "540"))
-# Ожидание ответа ComfyUI на постановку задачи и на websocket. Было 30 с: 20.10
-# на медленном сетевом диске свежий под отвечал на первую задачу дольше —
-# хендлер бросал её (Failed за 30,5 с), а следующую считал «ComfyUI мёртв» и
-# перезапускал под. Каждый новый под сжигал две задачи людей.
+# Потолок на всю задачу, считая от её начала (проверка ComfyUI, постановка,
+# генерация): держим ниже executionTimeout эндпоинта (600 с) — его превышение
+# RunPod карает остановкой воркера, а не только провалом задачи. 570: раньше
+# 540 с отсчитывались после постановки, теперь от начала — время на генерацию
+# то же, 30 с запаса на историю, base64 и снятие задачи.
+JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "570"))
+# Ожидание ответа ComfyUI на постановку задачи и на websocket (не дольше
+# остатка JOB_TIMEOUT_S). Было 30 с: 20.10 на медленном сетевом диске свежий
+# под отвечал на первую задачу дольше — хендлер бросал её (Failed за 30,5 с),
+# а следующую считал «ComfyUI мёртв» и перезапускал под. Каждый новый под
+# сжигал две задачи людей.
 COMFY_HTTP_TIMEOUT_S = int(os.environ.get("COMFY_HTTP_TIMEOUT_S", "300"))
 # Сколько перед задачей ждём ComfyUI, который не отвечает, но процесс жив (занят).
 PRE_JOB_ALIVE_WAIT_S = int(os.environ.get("PRE_JOB_ALIVE_WAIT_S", "120"))
@@ -140,15 +144,24 @@ def _comfy_alive(timeout: float = 5) -> bool:
         return False
 
 
-def _comfy_ready_for_job() -> bool:
+def _left_s(job_deadline: float) -> float:
+    """Сколько секунд осталось у задачи; кончилось — TimeoutError."""
+    left = job_deadline - time.time()
+    if left <= 0:
+        raise TimeoutError(f"job exceeded {JOB_TIMEOUT_S}s")
+    return left
+
+
+def _comfy_ready_for_job(job_deadline: float) -> bool:
     """ComfyUI отвечает — берём задачу. Не отвечает, но процесс жив — он занят,
-    ждём до PRE_JOB_ALIVE_WAIT_S. Процесса нет или не дождались — под мёртв.
-    Раньше хватало одного запроса на 5 с, и занятый ComfyUI считался мёртвым (20.10)."""
-    deadline = time.time() + PRE_JOB_ALIVE_WAIT_S
+    ждём до PRE_JOB_ALIVE_WAIT_S (и не дольше бюджета задачи). Процесса нет или
+    не дождались — под мёртв. Раньше хватало одного запроса на 5 с, и занятый
+    ComfyUI считался мёртвым (20.10)."""
+    wait_until = min(time.time() + PRE_JOB_ALIVE_WAIT_S, job_deadline)
     while True:
         if _comfy_alive(timeout=10):
             return True
-        if _comfy_pid() is None or time.time() >= deadline:
+        if _comfy_pid() is None or time.time() >= wait_until:
             return False
         print("[h3-worker] ComfyUI busy, process alive — waiting", flush=True)
         time.sleep(5)
@@ -192,49 +205,60 @@ def _stage_images(images: list[dict]) -> list[Path]:
     return staged
 
 
-def _queue_prompt(workflow: dict, client_id: str) -> str:
+def _open_ws(client_id: str, job_deadline: float) -> "websocket.WebSocket":
+    """Websocket открываем ДО постановки задачи — иначе быстрый финиш или ошибка
+    задачи проскочат мимо, и хендлер прождёт весь бюджет (ревью 20.10)."""
+    ws = websocket.WebSocket()
+    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}",
+               timeout=min(COMFY_HTTP_TIMEOUT_S, _left_s(job_deadline)))
+    return ws
+
+
+def _queue_prompt(workflow: dict, client_id: str, prompt_id: str, job_deadline: float) -> str:
+    # prompt_id свой (ComfyUI v0.31 принимает UUID клиента): по нему снимаем
+    # задачу с ComfyUI, если сами её бросили.
     r = requests.post(
         f"http://{COMFY_HOST}/prompt",
-        json={"prompt": workflow, "client_id": client_id},
-        timeout=COMFY_HTTP_TIMEOUT_S,
+        json={"prompt": workflow, "client_id": client_id, "prompt_id": prompt_id},
+        timeout=min(COMFY_HTTP_TIMEOUT_S, _left_s(job_deadline)),
     )
     r.raise_for_status()
     return r.json()["prompt_id"]
 
 
-def _await_completion(prompt_id: str, client_id: str, timeout_s: int) -> dict:
+def _drop_prompt(prompt_id: str) -> None:
+    """Задачу бросили (таймаут/ошибка) — снимаем её с ComfyUI: из очереди и, если
+    уже идёт, прерываем. Иначе он дорендерит её вхолостую, а следующая задача
+    встанет за ней. Best effort: ComfyUI может не ответить."""
+    for path, body in (("/queue", {"delete": [prompt_id]}), ("/interrupt", {"prompt_id": prompt_id})):
+        try:
+            requests.post(f"http://{COMFY_HOST}{path}", json=body, timeout=5)
+        except Exception as e:  # noqa: BLE001
+            print(f"[h3-worker] {path} for {prompt_id} failed: {e}", flush=True)
+
+
+def _await_completion(ws: "websocket.WebSocket", prompt_id: str, job_deadline: float) -> dict:
     """Ждём выполнения через websocket, историю читаем по завершении.
 
     Websocket, а не поллинг /history: на длинных видео поллинг раз в секунду
     заваливает ComfyUI лишними запросами, а нам важна каждая секунда GPU.
     """
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=COMFY_HTTP_TIMEOUT_S)
-    ws.settimeout(timeout_s)
-    deadline = time.time() + timeout_s
-    try:
-        while time.time() < deadline:
-            msg = ws.recv()
-            if isinstance(msg, bytes):
-                continue  # превью-кадры — игнорируем
-            data = json.loads(msg)
-            if data.get("type") == "executing":
-                d = data.get("data", {})
-                if d.get("node") is None and d.get("prompt_id") == prompt_id:
-                    break
-            elif data.get("type") == "execution_error":
-                d = data.get("data", {})
-                if d.get("prompt_id") == prompt_id:
-                    raise RuntimeError(
-                        f"ComfyUI execution error: {str(d.get('exception_message'))[:300]}"
-                    )
-        else:
-            raise TimeoutError(f"generation exceeded {timeout_s}s")
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+    while True:
+        ws.settimeout(_left_s(job_deadline))
+        msg = ws.recv()
+        if isinstance(msg, bytes):
+            continue  # превью-кадры — игнорируем
+        data = json.loads(msg)
+        if data.get("type") == "executing":
+            d = data.get("data", {})
+            if d.get("node") is None and d.get("prompt_id") == prompt_id:
+                break
+        elif data.get("type") == "execution_error":
+            d = data.get("data", {})
+            if d.get("prompt_id") == prompt_id:
+                raise RuntimeError(
+                    f"ComfyUI execution error: {str(d.get('exception_message'))[:300]}"
+                )
 
     r = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}", timeout=30)
     r.raise_for_status()
@@ -281,22 +305,35 @@ def handler(job: dict) -> dict:
         return {"error": "input.workflow is required (ComfyUI API-format JSON)",
                 "stage": "validate"}
 
+    started = time.time()
+    job_deadline = started + JOB_TIMEOUT_S
+
     # Мёртвый ComfyUI — не берём задачу вообще: пусть RunPod отдаст её другому
     # поду, а этот уйдёт. Иначе получаем серию мгновенных фейлов у живых юзеров.
-    if not _comfy_ready_for_job():
+    if not _comfy_ready_for_job(job_deadline):
         _exit_worker("comfyui dead before job")
         return {"error": "ComfyUI is not reachable", "stage": "healthcheck"}
 
     client_id = str(uuid.uuid4())
+    prompt_id = str(uuid.uuid4())
+    queued = finished = False
     staged: list[Path] = []
-    started = time.time()
     _probe_stop = _start_ram_probe(str(job.get("id", "?"))[:12])
     _c0, _m0 = _cgroup_mem()
     print(f"[h3-worker] RAM at job start: cgroup={_c0}/{_m0}GB comfy_rss={_comfy_rss_gb()}GB", flush=True)
     try:
         staged = _stage_images(job_input.get("images") or [])
-        prompt_id = _queue_prompt(workflow, client_id)
-        history = _await_completion(prompt_id, client_id, JOB_TIMEOUT_S)
+        ws = _open_ws(client_id, job_deadline)
+        try:
+            queued = True  # с этого момента задача может оказаться в очереди ComfyUI
+            prompt_id = _queue_prompt(workflow, client_id, prompt_id, job_deadline)
+            history = _await_completion(ws, prompt_id, job_deadline)
+            finished = True
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
         video_path = _collect_video(history)
         if video_path is None:
@@ -318,6 +355,8 @@ def handler(job: dict) -> dict:
     except Exception as e:  # noqa: BLE001 — текст наружу, RunPod пометит FAILED
         return {"error": f"{type(e).__name__}: {str(e)[:300]}", "stage": "generate"}
     finally:
+        if queued and not finished:
+            _drop_prompt(prompt_id)
         _probe_stop.set()
         for p in staged:
             try:

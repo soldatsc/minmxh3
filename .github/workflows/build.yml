@@ -3,6 +3,12 @@ name: build & push image
 # Собираем на пуш в main и по кнопке. Модели в образ НЕ запекаем (BAKE_MODELS=0):
 # с ними образ ~60 ГБ, раннер GitHub столько не вывезет — веса приезжают на
 # network volume, см. scripts/download_models.sh.
+#
+# 20.10: по умолчанию (пуш и кнопка) собирается Dockerfile.handler — проверенный
+# рабочий образ + новый handler.py. Полный Dockerfile ставит torch/кастом-ноды без
+# пинов, пересборка с нуля дала другой стек — только по кнопке с full=true.
+# Тег latest больше не двигаем: эндпоинт RunPod ссылается на sha-тег, новый образ
+# включается осознанно через New release.
 on:
   push:
     branches: [main]
@@ -12,9 +18,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Доп. тег образа (кроме latest и sha)'
+        description: 'Доп. тег образа (кроме sha)'
         required: false
         default: ''
+      full:
+        description: 'Полная пересборка по Dockerfile (без пинов, другой стек) — только осознанно'
+        type: boolean
+        required: false
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -57,7 +68,6 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
@@ -65,15 +75,16 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ inputs.full && 'Dockerfile' || 'Dockerfile.handler' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BAKE_MODELS=0
-          # Кеш в GHA: слой с torch тянется минут пять, без кеша каждая правка
-          # хендлера пересобирала бы всё заново.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Кеш в GHA нужен только полной сборке (слой с torch тянется минут
+          # пять); сборка хендлера — один COPY поверх готового образа.
+          cache-from: ${{ inputs.full && 'type=gha' || '' }}
+          cache-to: ${{ inputs.full && 'type=gha,mode=max' || '' }}
 
       - name: Итог
         run: |

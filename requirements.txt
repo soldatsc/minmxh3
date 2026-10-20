@@ -1,5 +1,5 @@
 # Только то, что нужно хендлеру. ComfyUI и torch ставятся в Dockerfile
 # отдельно (torch — строго под cu128, иначе 5090 не заведётся).
-runpod>=1.7.0
+runpod==1.12.0
 requests>=2.32.0
 websocket-client>=1.8.0
